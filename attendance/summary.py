@@ -1,0 +1,189 @@
+from datetime import date
+from typing import List, Dict
+from collections import defaultdict
+
+from .models import (
+    AttendanceData, AttendanceStatus, DepartmentSummary,
+    EmployeeSummary, LeaveType
+)
+
+
+class AttendanceSummary:
+    def __init__(self, attendance_data: AttendanceData):
+        self.data = attendance_data
+
+    def _is_weekday(self, d: date) -> bool:
+        return d.weekday() < 5
+
+    def _get_workdays_in_month(self, year: int, month: int) -> int:
+        if year == 0 or month == 0:
+            return 22
+        import calendar
+        cal = calendar.Calendar()
+        workdays = 0
+        for day in cal.itermonthdays(year, month):
+            if day > 0:
+                d = date(year, month, day)
+                if self._is_weekday(d):
+                    workdays += 1
+        return workdays
+
+    def generate_employee_summary(self, employee_id: str) -> EmployeeSummary:
+        emp = self.data.get_employee(employee_id)
+        if not emp:
+            raise ValueError(f"员工不存在: {employee_id}")
+
+        punches = self.data.get_employee_punches(employee_id)
+        leaves = self.data.get_employee_leaves(employee_id)
+        trips = self.data.get_employee_business_trips(employee_id)
+        overtimes = self.data.get_employee_overtimes(employee_id)
+        issues = [i for i in self.data.check_issues if i.employee_id == employee_id]
+
+        attendance_days = 0.0
+        absence_count = 0
+        overtime_hours = 0.0
+        late_count = 0
+        early_leave_count = 0
+        missing_punch_count = 0
+        leave_days: Dict[str, float] = defaultdict(float)
+        business_trip_days = 0.0
+
+        for punch in punches:
+            if punch.status == AttendanceStatus.NORMAL:
+                attendance_days += 1.0
+            elif punch.status == AttendanceStatus.LATE:
+                attendance_days += 1.0
+                late_count += 1
+            elif punch.status == AttendanceStatus.EARLY_LEAVE:
+                attendance_days += 1.0
+                early_leave_count += 1
+            elif punch.status == AttendanceStatus.MISSING_PUNCH:
+                attendance_days += 0.5
+                missing_punch_count += 1
+            elif punch.status == AttendanceStatus.ABSENT:
+                absence_count += 1
+            elif punch.status == AttendanceStatus.ON_LEAVE:
+                pass
+            elif punch.status == AttendanceStatus.BUSINESS_TRIP:
+                attendance_days += 1.0
+
+        for leave in leaves:
+            if leave.approved:
+                leave_days[leave.leave_type.value] += leave.days
+
+        for trip in trips:
+            business_trip_days += trip.days
+            attendance_days += trip.days
+
+        for ot in overtimes:
+            if ot.approved:
+                overtime_hours += ot.hours
+
+        needs_confirm = any(i.needs_confirmation for i in issues)
+
+        summary = EmployeeSummary(
+            employee_id=employee_id,
+            name=emp.name,
+            department=emp.department,
+            attendance_days=round(attendance_days, 2),
+            absence_count=absence_count,
+            overtime_hours=round(overtime_hours, 2),
+            late_count=late_count,
+            early_leave_count=early_leave_count,
+            missing_punch_count=missing_punch_count,
+            leave_days=dict(leave_days),
+            business_trip_days=round(business_trip_days, 2),
+            issues=issues
+        )
+
+        return summary
+
+    def generate_all_employee_summaries(self) -> List[EmployeeSummary]:
+        summaries = []
+        for emp_id in self.data.employees:
+            summaries.append(self.generate_employee_summary(emp_id))
+        return summaries
+
+    def generate_department_summary(self, department: str) -> DepartmentSummary:
+        emp_ids = [eid for eid, e in self.data.employees.items() if e.department == department]
+        if not emp_ids:
+            raise ValueError(f"部门不存在: {department}")
+
+        total_attendance_days = 0.0
+        total_absence_count = 0
+        total_overtime_hours = 0.0
+        employees_needing_confirmation = []
+
+        workdays = self._get_workdays_in_month(self.data.year, self.data.month)
+
+        attendance_rates = []
+
+        for emp_id in emp_ids:
+            emp_summary = self.generate_employee_summary(emp_id)
+            total_attendance_days += emp_summary.attendance_days
+            total_absence_count += emp_summary.absence_count
+            total_overtime_hours += emp_summary.overtime_hours
+
+            if emp_summary.issues and any(i.needs_confirmation for i in emp_summary.issues):
+                employees_needing_confirmation.append(emp_summary.name)
+
+            if workdays > 0:
+                rate = emp_summary.attendance_days / workdays * 100
+                attendance_rates.append(min(rate, 100))
+
+        avg_attendance_rate = sum(attendance_rates) / len(attendance_rates) if attendance_rates else 0.0
+
+        return DepartmentSummary(
+            department=department,
+            employee_count=len(emp_ids),
+            total_attendance_days=round(total_attendance_days, 2),
+            total_absence_count=total_absence_count,
+            total_overtime_hours=round(total_overtime_hours, 2),
+            average_attendance_rate=round(avg_attendance_rate, 2),
+            employees_needing_confirmation=employees_needing_confirmation
+        )
+
+    def generate_all_department_summaries(self) -> List[DepartmentSummary]:
+        departments = set(e.department for e in self.data.employees.values() if e.department)
+        summaries = []
+        for dept in sorted(departments):
+            summaries.append(self.generate_department_summary(dept))
+        return summaries
+
+    def get_summary_stats(self) -> Dict:
+        dept_summaries = self.generate_all_department_summaries()
+        emp_summaries = self.generate_all_employee_summaries()
+
+        total_employees = len(self.data.employees)
+        total_departments = len(dept_summaries)
+        total_attendance = sum(s.total_attendance_days for s in dept_summaries)
+        total_absences = sum(s.total_absence_count for s in dept_summaries)
+        total_overtime = sum(s.total_overtime_hours for s in dept_summaries)
+
+        avg_attendance_rate = (
+            sum(s.average_attendance_rate for s in dept_summaries) / total_departments
+            if total_departments > 0 else 0.0
+        )
+
+        employees_with_issues = sum(
+            1 for s in emp_summaries if s.late_count > 0 or s.early_leave_count > 0
+            or s.missing_punch_count > 0 or s.absence_count > 0
+        )
+
+        employees_needing_confirm = sum(
+            1 for s in emp_summaries if any(i.needs_confirmation for i in s.issues)
+        )
+
+        return {
+            "year": self.data.year,
+            "month": self.data.month,
+            "total_employees": total_employees,
+            "total_departments": total_departments,
+            "total_attendance_days": round(total_attendance, 2),
+            "total_absence_count": total_absences,
+            "total_overtime_hours": round(total_overtime, 2),
+            "average_attendance_rate": round(avg_attendance_rate, 2),
+            "employees_with_issues": employees_with_issues,
+            "employees_needing_confirmation": employees_needing_confirm,
+            "total_check_issues": len(self.data.check_issues),
+        }
