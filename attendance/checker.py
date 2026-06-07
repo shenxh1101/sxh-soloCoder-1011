@@ -35,13 +35,15 @@ class AttendanceChecker:
             issue_date=issue_date,
             description=description,
             severity=severity,
-            needs_confirmation=needs_confirmation
+            needs_confirmation=needs_confirmation,
+            deadline=issue_date + timedelta(days=3)
         )
         self.data.check_issues.append(issue)
 
     def check_late_arrival(self) -> int:
         count = 0
-        for punch in self.data.punch_records:
+        punches = self.data.get_month_punches()
+        for punch in punches:
             if punch.status in [AttendanceStatus.ON_LEAVE, AttendanceStatus.BUSINESS_TRIP]:
                 continue
             if punch.status == AttendanceStatus.LATE:
@@ -66,7 +68,8 @@ class AttendanceChecker:
 
     def check_early_leave(self) -> int:
         count = 0
-        for punch in self.data.punch_records:
+        punches = self.data.get_month_punches()
+        for punch in punches:
             if punch.status in [AttendanceStatus.ON_LEAVE, AttendanceStatus.BUSINESS_TRIP]:
                 continue
             if punch.status == AttendanceStatus.EARLY_LEAVE:
@@ -91,7 +94,8 @@ class AttendanceChecker:
 
     def check_missing_punch(self) -> int:
         count = 0
-        for punch in self.data.punch_records:
+        punches = self.data.get_month_punches()
+        for punch in punches:
             if punch.status in [AttendanceStatus.ON_LEAVE, AttendanceStatus.BUSINESS_TRIP]:
                 continue
 
@@ -99,12 +103,16 @@ class AttendanceChecker:
             if not emp:
                 continue
 
-            is_weekend = punch.punch_date.weekday() >= 5
-            if is_weekend and not punch.punch_in and not punch.punch_out:
+            if self.data.is_holiday(punch.punch_date):
+                if not punch.punch_in and not punch.punch_out:
+                    continue
+
+            is_non_workday = not self.data.is_workday(punch.punch_date)
+            if is_non_workday and not punch.punch_in and not punch.punch_out:
                 continue
 
-            missing_in = punch.punch_in is None and not is_weekend
-            missing_out = punch.punch_out is None and not is_weekend
+            missing_in = punch.punch_in is None and self.data.is_workday(punch.punch_date)
+            missing_out = punch.punch_out is None and self.data.is_workday(punch.punch_date)
 
             if missing_in or missing_out:
                 missing_type = "上班" if missing_in else "下班"
@@ -129,7 +137,8 @@ class AttendanceChecker:
         count = 0
         employee_leaves: Dict[str, List[LeaveRecord]] = defaultdict(list)
 
-        for leave in self.data.leave_records:
+        leaves = self.data.get_month_leaves()
+        for leave in leaves:
             if not leave.approved:
                 continue
             employee_leaves[leave.employee_id].append(leave)
@@ -144,6 +153,9 @@ class AttendanceChecker:
                         overlap_end = min(l1.end_date, l2.end_date)
                         overlap_days = (overlap_end - overlap_start).days + 1
 
+                        if not self.data.is_in_month(overlap_start) and not self.data.is_in_month(overlap_end):
+                            continue
+
                         self._add_issue(
                             employee_id=emp_id,
                             issue_type=CheckIssueType.LEAVE_CONFLICT,
@@ -154,7 +166,7 @@ class AttendanceChecker:
                         )
                         count += 1
 
-        for leave in self.data.leave_records:
+        for leave in leaves:
             if not leave.approved:
                 continue
             emp_id = leave.employee_id
@@ -162,6 +174,9 @@ class AttendanceChecker:
             balance = balances.get(leave.leave_type)
 
             if balance and balance.remaining_days < leave.days:
+                if not self.data.is_in_month(leave.start_date):
+                    continue
+
                 self._add_issue(
                     employee_id=emp_id,
                     issue_type=CheckIssueType.LEAVE_BALANCE_INSUFFICIENT,
@@ -172,9 +187,13 @@ class AttendanceChecker:
                 )
                 count += 1
 
-            for trip in self.data.get_employee_business_trips(emp_id):
+            trips = self.data.get_employee_business_trips(emp_id)
+            for trip in trips:
                 if self._date_ranges_overlap(leave.start_date, leave.end_date, trip.start_date, trip.end_date):
                     overlap_start = max(leave.start_date, trip.start_date)
+                    if not self.data.is_in_month(overlap_start):
+                        continue
+
                     self._add_issue(
                         employee_id=emp_id,
                         issue_type=CheckIssueType.LEAVE_CONFLICT,
@@ -195,14 +214,13 @@ class AttendanceChecker:
         if target_year == 0 or target_month == 0:
             return count
 
-        for leave in self.data.leave_records:
+        leaves = self.data.get_month_leaves()
+        for leave in leaves:
             if not leave.approved:
                 continue
 
-            leave_starts_this_month = (leave.start_date.year == target_year and
-                                       leave.start_date.month == target_month)
-            leave_ends_this_month = (leave.end_date.year == target_year and
-                                     leave.end_date.month == target_month)
+            leave_starts_this_month = self.data.is_in_month(leave.start_date)
+            leave_ends_this_month = self.data.is_in_month(leave.end_date)
 
             if leave_starts_this_month and not leave_ends_this_month:
                 self._add_issue(
@@ -225,11 +243,10 @@ class AttendanceChecker:
                 )
                 count += 1
 
-        for trip in self.data.business_trip_records:
-            trip_starts_this_month = (trip.start_date.year == target_year and
-                                      trip.start_date.month == target_month)
-            trip_ends_this_month = (trip.end_date.year == target_year and
-                                    trip.end_date.month == target_month)
+        trips = self.data.get_month_business_trips()
+        for trip in trips:
+            trip_starts_this_month = self.data.is_in_month(trip.start_date)
+            trip_ends_this_month = self.data.is_in_month(trip.end_date)
 
             if trip_starts_this_month and not trip_ends_this_month:
                 self._add_issue(
@@ -252,7 +269,8 @@ class AttendanceChecker:
                 )
                 count += 1
 
-        for punch in self.data.punch_records:
+        punches = self.data.get_month_punches()
+        for punch in punches:
             if punch.punch_in and punch.punch_out:
                 if punch.punch_in.date() != punch.punch_out.date():
                     self._add_issue(
@@ -271,7 +289,8 @@ class AttendanceChecker:
         count = 0
         employee_daily_overtime: Dict[Tuple[str, date], float] = defaultdict(float)
 
-        for ot in self.data.overtime_records:
+        overtimes = self.data.get_month_overtimes()
+        for ot in overtimes:
             if not ot.approved:
                 continue
 
@@ -291,15 +310,13 @@ class AttendanceChecker:
                 count += 1
 
         employee_monthly_overtime: Dict[str, float] = defaultdict(float)
-        for ot in self.data.overtime_records:
+        for ot in overtimes:
             if not ot.approved:
                 continue
-            if (ot.overtime_date.year == self.data.year and
-                    ot.overtime_date.month == self.data.month):
-                employee_monthly_overtime[ot.employee_id] += ot.hours
+            employee_monthly_overtime[ot.employee_id] += ot.hours
 
         for emp_id, total_hours in employee_monthly_overtime.items():
-            monthly_max = self.max_overtime_hours * 22
+            monthly_max = self.max_overtime_hours * self.data.get_standard_workdays()
             if total_hours > monthly_max:
                 self._add_issue(
                     employee_id=emp_id,
@@ -311,7 +328,7 @@ class AttendanceChecker:
                 )
                 count += 1
 
-        for ot in self.data.overtime_records:
+        for ot in overtimes:
             if not ot.approved:
                 continue
 
@@ -356,6 +373,8 @@ class AttendanceChecker:
             "abnormal_overtime": self.check_abnormal_overtime(),
         }
         results["total"] = sum(results.values())
+
+        self.data.mark_check_done()
 
         return results
 

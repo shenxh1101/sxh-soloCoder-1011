@@ -9,9 +9,10 @@ class Notifier:
         self.data = attendance_data
 
     def get_notification_records(self, only_needs_confirmation: bool = True) -> List[CheckIssue]:
+        issues = self.data.get_month_issues()
         if only_needs_confirmation:
-            return [i for i in self.data.check_issues if i.needs_confirmation]
-        return list(self.data.check_issues)
+            return [i for i in issues if i.needs_confirmation]
+        return list(issues)
 
     def get_notifications_by_employee(self, employee_id: Optional[str] = None) -> Dict[str, List[CheckIssue]]:
         result: Dict[str, List[CheckIssue]] = defaultdict(list)
@@ -47,7 +48,7 @@ class Notifier:
         return dict(result)
 
     def get_employee_notification_summary(self, employee_id: str) -> Dict:
-        issues = [i for i in self.data.check_issues
+        issues = [i for i in self.data.get_month_issues()
                   if i.employee_id == employee_id and i.needs_confirmation]
 
         issue_count_by_type: Dict[str, int] = defaultdict(int)
@@ -65,7 +66,7 @@ class Notifier:
         }
 
     def get_department_notification_summary(self, department: str) -> Dict:
-        issues = [i for i in self.data.check_issues
+        issues = [i for i in self.data.get_month_issues()
                   if i.department == department and i.needs_confirmation]
 
         employees = set(i.employee_id for i in issues)
@@ -103,6 +104,7 @@ class Notifier:
         return {
             "year": self.data.year,
             "month": self.data.month,
+            "month_str": self.data.month_str,
             "affected_departments": len(departments),
             "affected_employees": len(employees),
             "total_notifications": len(issues),
@@ -130,29 +132,38 @@ class Notifier:
                     f"[{issue.issue_type.value}] {issue.issue_date.strftime('%Y-%m-%d')}: {issue.description}"
                 )
 
+            earliest_deadline = None
+            for issue in issues:
+                if issue.deadline:
+                    if earliest_deadline is None or issue.deadline < earliest_deadline:
+                        earliest_deadline = issue.deadline
+
             message = {
                 "employee_id": emp_id,
                 "name": emp.name,
                 "department": emp.department,
                 "notification_count": len(issues),
                 "issue_types": list(set(i.issue_type.value for i in issues)),
-                "message": self._format_message(emp.name, issues),
-                "details": issue_descriptions
+                "earliest_deadline": earliest_deadline,
+                "message": self._format_message(emp.name, issues, earliest_deadline),
+                "details": issue_descriptions,
+                "issues": issues
             }
             messages.append(message)
 
         return sorted(messages, key=lambda x: (-x["notification_count"], x["department"], x["name"]))
 
-    def _format_message(self, name: str, issues: List[CheckIssue]) -> str:
+    def _format_message(self, name: str, issues: List[CheckIssue], deadline) -> str:
         type_counts: Dict[str, int] = defaultdict(int)
         for issue in issues:
             type_counts[issue.issue_type.value] += 1
 
         type_str = "、".join([f"{k}×{v}" for k, v in type_counts.items()])
+        deadline_str = f"处理截止日期为 {deadline.strftime('%Y-%m-%d')}" if deadline else "请尽快处理"
 
         return (
             f"{name}您好，您本月有 {len(issues)} 条考勤记录需要确认："
-            f"{type_str}。请尽快登录系统补充说明或提交相关证明材料。"
+            f"{type_str}。{deadline_str}，请尽快登录系统补充说明或提交相关证明材料。"
         )
 
     def export_notification_list(self, output_path: Optional[str] = None) -> List[Dict]:
@@ -160,15 +171,18 @@ class Notifier:
         rows = []
 
         for msg in messages:
-            rows.append({
-                "工号": msg["employee_id"],
-                "姓名": msg["name"],
-                "部门": msg["department"],
-                "待确认数量": msg["notification_count"],
-                "问题类型": "、".join(msg["issue_types"]),
-                "通知内容": msg["message"],
-                "详细问题": "\n".join(msg["details"])
-            })
+            for issue in msg["issues"]:
+                rows.append({
+                    "部门": msg["department"],
+                    "工号": msg["employee_id"],
+                    "姓名": msg["name"],
+                    "异常日期": issue.issue_date.strftime("%Y-%m-%d"),
+                    "异常类型": issue.issue_type.value,
+                    "异常原因": issue.description,
+                    "严重程度": {"error": "错误", "warning": "警告", "info": "提示"}.get(issue.severity, issue.severity),
+                    "处理截止日期": issue.deadline.strftime("%Y-%m-%d") if issue.deadline else "",
+                    "是否需确认": "是" if issue.needs_confirmation else "否",
+                })
 
         if output_path:
             import pandas as pd
@@ -176,10 +190,13 @@ class Notifier:
             Path(output_path).parent.mkdir(parents=True, exist_ok=True)
 
             df = pd.DataFrame(rows)
+            if not df.empty:
+                df = df.sort_values(["部门", "工号", "异常日期"])
+
             if output_path.endswith(".csv"):
                 df.to_csv(output_path, index=False, encoding="utf-8-sig")
             else:
-                df.to_excel(output_path, index=False, sheet_name="待确认通知")
+                df.to_excel(output_path, index=False, sheet_name="待确认清单")
 
             return output_path
 
@@ -194,7 +211,8 @@ class Notifier:
 
         reminder_data: Dict[str, Dict] = defaultdict(lambda: {
             "issues": [],
-            "oldest_issue_date": None
+            "oldest_issue_date": None,
+            "earliest_deadline": None
         })
 
         for issue in issues:
@@ -203,13 +221,19 @@ class Notifier:
             if (reminder_data[emp_id]["oldest_issue_date"] is None or
                     issue.issue_date < reminder_data[emp_id]["oldest_issue_date"]):
                 reminder_data[emp_id]["oldest_issue_date"] = issue.issue_date
+            if issue.deadline:
+                if (reminder_data[emp_id]["earliest_deadline"] is None or
+                        issue.deadline < reminder_data[emp_id]["earliest_deadline"]):
+                    reminder_data[emp_id]["earliest_deadline"] = issue.deadline
 
         urgent_reminders = []
         for emp_id, data in reminder_data.items():
             oldest_date = data["oldest_issue_date"]
+            earliest_deadline = data["earliest_deadline"]
             if oldest_date:
                 days_pending = (today - oldest_date).days
                 is_urgent = days_pending >= 7
+                is_overdue = earliest_deadline and earliest_deadline < today
 
                 emp = self.data.get_employee(emp_id)
                 urgent_reminders.append({
@@ -218,8 +242,10 @@ class Notifier:
                     "department": emp.department if emp else "",
                     "pending_count": len(data["issues"]),
                     "oldest_issue_date": oldest_date.strftime("%Y-%m-%d"),
+                    "earliest_deadline": earliest_deadline.strftime("%Y-%m-%d") if earliest_deadline else "",
                     "days_pending": days_pending,
                     "is_urgent": is_urgent,
+                    "is_overdue": is_overdue,
                     "deadline": deadline.strftime("%Y-%m-%d")
                 })
 

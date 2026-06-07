@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from .models import (
     AttendanceData, AttendanceStatus, DepartmentSummary,
-    EmployeeSummary, LeaveType
+    EmployeeSummary, LeaveType, CheckIssueType
 )
 
 
@@ -12,32 +12,18 @@ class AttendanceSummary:
     def __init__(self, attendance_data: AttendanceData):
         self.data = attendance_data
 
-    def _is_weekday(self, d: date) -> bool:
-        return d.weekday() < 5
-
-    def _get_workdays_in_month(self, year: int, month: int) -> int:
-        if year == 0 or month == 0:
-            return 22
-        import calendar
-        cal = calendar.Calendar()
-        workdays = 0
-        for day in cal.itermonthdays(year, month):
-            if day > 0:
-                d = date(year, month, day)
-                if self._is_weekday(d):
-                    workdays += 1
-        return workdays
-
     def generate_employee_summary(self, employee_id: str) -> EmployeeSummary:
         emp = self.data.get_employee(employee_id)
         if not emp:
             raise ValueError(f"员工不存在: {employee_id}")
 
-        punches = self.data.get_employee_punches(employee_id)
-        leaves = self.data.get_employee_leaves(employee_id)
-        trips = self.data.get_employee_business_trips(employee_id)
-        overtimes = self.data.get_employee_overtimes(employee_id)
-        issues = [i for i in self.data.check_issues if i.employee_id == employee_id]
+        punches = self.data.get_employee_punches(employee_id, month_only=True)
+        leaves = self.data.get_employee_leaves(employee_id, month_only=True)
+        trips = self.data.get_employee_business_trips(employee_id, month_only=True)
+        overtimes = self.data.get_employee_overtimes(employee_id, month_only=True)
+        issues = [i for i in self.data.get_month_issues() if i.employee_id == employee_id]
+
+        standard_workdays = self.data.get_standard_workdays()
 
         attendance_days = 0.0
         absence_count = 0
@@ -47,6 +33,7 @@ class AttendanceSummary:
         missing_punch_count = 0
         leave_days: Dict[str, float] = defaultdict(float)
         business_trip_days = 0.0
+        issue_summary: Dict[str, int] = defaultdict(int)
 
         for punch in punches:
             if punch.status == AttendanceStatus.NORMAL:
@@ -69,15 +56,20 @@ class AttendanceSummary:
 
         for leave in leaves:
             if leave.approved:
-                leave_days[leave.leave_type.value] += leave.days
+                if self.data.is_in_month(leave.start_date) or self.data.is_in_month(leave.end_date):
+                    leave_days[leave.leave_type.value] += leave.days
 
         for trip in trips:
-            business_trip_days += trip.days
-            attendance_days += trip.days
+            if self.data.is_in_month(trip.start_date) or self.data.is_in_month(trip.end_date):
+                business_trip_days += trip.days
+                attendance_days += trip.days
 
         for ot in overtimes:
             if ot.approved:
                 overtime_hours += ot.hours
+
+        for issue in issues:
+            issue_summary[issue.issue_type.value] += 1
 
         needs_confirm = any(i.needs_confirmation for i in issues)
 
@@ -85,6 +77,7 @@ class AttendanceSummary:
             employee_id=employee_id,
             name=emp.name,
             department=emp.department,
+            standard_workdays=standard_workdays,
             attendance_days=round(attendance_days, 2),
             absence_count=absence_count,
             overtime_hours=round(overtime_hours, 2),
@@ -93,7 +86,9 @@ class AttendanceSummary:
             missing_punch_count=missing_punch_count,
             leave_days=dict(leave_days),
             business_trip_days=round(business_trip_days, 2),
-            issues=issues
+            issues=issues,
+            issue_summary=dict(issue_summary),
+            needs_confirmation=needs_confirm
         )
 
         return summary
@@ -113,8 +108,7 @@ class AttendanceSummary:
         total_absence_count = 0
         total_overtime_hours = 0.0
         employees_needing_confirmation = []
-
-        workdays = self._get_workdays_in_month(self.data.year, self.data.month)
+        standard_workdays = self.data.get_standard_workdays()
 
         attendance_rates = []
 
@@ -124,11 +118,11 @@ class AttendanceSummary:
             total_absence_count += emp_summary.absence_count
             total_overtime_hours += emp_summary.overtime_hours
 
-            if emp_summary.issues and any(i.needs_confirmation for i in emp_summary.issues):
+            if emp_summary.needs_confirmation:
                 employees_needing_confirmation.append(emp_summary.name)
 
-            if workdays > 0:
-                rate = emp_summary.attendance_days / workdays * 100
+            if standard_workdays > 0:
+                rate = emp_summary.attendance_days / standard_workdays * 100
                 attendance_rates.append(min(rate, 100))
 
         avg_attendance_rate = sum(attendance_rates) / len(attendance_rates) if attendance_rates else 0.0
@@ -140,6 +134,7 @@ class AttendanceSummary:
             total_absence_count=total_absence_count,
             total_overtime_hours=round(total_overtime_hours, 2),
             average_attendance_rate=round(avg_attendance_rate, 2),
+            standard_workdays=standard_workdays,
             employees_needing_confirmation=employees_needing_confirmation
         )
 
@@ -171,12 +166,16 @@ class AttendanceSummary:
         )
 
         employees_needing_confirm = sum(
-            1 for s in emp_summaries if any(i.needs_confirmation for i in s.issues)
+            1 for s in emp_summaries if s.needs_confirmation
         )
+
+        standard_workdays = self.data.get_standard_workdays()
 
         return {
             "year": self.data.year,
             "month": self.data.month,
+            "month_str": self.data.month_str,
+            "standard_workdays": standard_workdays,
             "total_employees": total_employees,
             "total_departments": total_departments,
             "total_attendance_days": round(total_attendance, 2),
@@ -185,5 +184,7 @@ class AttendanceSummary:
             "average_attendance_rate": round(avg_attendance_rate, 2),
             "employees_with_issues": employees_with_issues,
             "employees_needing_confirmation": employees_needing_confirm,
-            "total_check_issues": len(self.data.check_issues),
+            "total_check_issues": len(self.data.get_month_issues()),
+            "check_dirty": self.data.check_dirty,
+            "data_dirty": self.data.data_dirty,
         }

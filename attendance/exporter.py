@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import List, Dict
 
-from .models import AttendanceData, LeaveType
+from .models import AttendanceData, LeaveType, CheckIssueType
 from .summary import AttendanceSummary
 from .leave_manager import LeaveManager
 
@@ -23,6 +23,8 @@ class DataExporter:
         emp_summaries = self.summary.generate_all_employee_summaries()
         rows = []
 
+        standard_workdays = self.data.get_standard_workdays()
+
         for emp_summary in emp_summaries:
             emp = self.data.get_employee(emp_summary.employee_id)
             if not emp:
@@ -34,13 +36,25 @@ class DataExporter:
                 (b for b in balances if b.leave_type == LeaveType.ANNUAL), None
             )
 
+            issue_summary_parts = []
+            for issue_type, count in emp_summary.issue_summary.items():
+                issue_summary_parts.append(f"{issue_type}×{count}")
+            issue_summary_str = "；".join(issue_summary_parts) if issue_summary_parts else ""
+
+            leave_usage_parts = []
+            for leave_type in LeaveType:
+                days = emp_summary.leave_days.get(leave_type.value, 0)
+                if days > 0:
+                    leave_usage_parts.append(f"{leave_type.value}×{days}")
+            leave_usage_str = "；".join(leave_usage_parts) if leave_usage_parts else ""
+
             row = {
                 "工号": emp_summary.employee_id,
                 "姓名": emp_summary.name,
                 "部门": emp_summary.department,
                 "职位": emp.position,
-                "考勤月份": f"{self.data.year}年{self.data.month}月",
-                "应出勤天数": self._get_workdays(),
+                "考勤月份": self.data.month_str or f"{self.data.year}年{self.data.month}月",
+                "应出勤天数": standard_workdays,
                 "实际出勤天数": emp_summary.attendance_days,
                 "出勤天数": emp_summary.attendance_days,
                 "缺勤天数": emp_summary.absence_count,
@@ -54,13 +68,17 @@ class DataExporter:
                     emp_summary.leave_days.get("病假", 0) -
                     emp_summary.leave_days.get("事假", 0), 2
                 ),
+                "各类假期用量": leave_usage_str,
                 "出差天数": emp_summary.business_trip_days,
                 "加班时长(小时)": emp_summary.overtime_hours,
                 "迟到次数": emp_summary.late_count,
                 "早退次数": emp_summary.early_leave_count,
                 "漏打卡次数": emp_summary.missing_punch_count,
+                "异常明细汇总": issue_summary_str,
+                "异常总数": len(emp_summary.issues),
+                "需确认异常数": len([i for i in emp_summary.issues if i.needs_confirmation]),
+                "需确认标记": "是" if emp_summary.needs_confirmation else "否",
                 "年假余额": annual_balance.remaining_days if annual_balance else 0,
-                "需确认异常": len([i for i in emp_summary.issues if i.needs_confirmation]),
                 "备注": "; ".join([i.description for i in emp_summary.issues[:3]]) if emp_summary.issues else ""
             }
             rows.append(row)
@@ -75,29 +93,19 @@ class DataExporter:
 
         return output_path
 
-    def _get_workdays(self) -> int:
-        if self.data.year == 0 or self.data.month == 0:
-            return 22
-        import calendar
-        cal = calendar.Calendar()
-        workdays = 0
-        for day in cal.itermonthdays(self.data.year, self.data.month):
-            if day > 0:
-                d = datetime(self.data.year, self.data.month, day).date()
-                if d.weekday() < 5:
-                    workdays += 1
-        return workdays
-
     def export_department_summary(self, output_path: str) -> str:
         self._ensure_dir(output_path)
 
         dept_summaries = self.summary.generate_all_department_summaries()
         rows = []
 
+        standard_workdays = self.data.get_standard_workdays()
+
         for dept_summary in dept_summaries:
             row = {
                 "部门": dept_summary.department,
                 "员工人数": dept_summary.employee_count,
+                "标准工作日": standard_workdays,
                 "总出勤天数": dept_summary.total_attendance_days,
                 "人均出勤天数": round(dept_summary.total_attendance_days / dept_summary.employee_count, 2) if dept_summary.employee_count > 0 else 0,
                 "总缺勤次数": dept_summary.total_absence_count,
@@ -113,6 +121,7 @@ class DataExporter:
         rows.append({
             "部门": "合计",
             "员工人数": stats["total_employees"],
+            "标准工作日": standard_workdays,
             "总出勤天数": stats["total_attendance_days"],
             "人均出勤天数": round(stats["total_attendance_days"] / stats["total_employees"], 2) if stats["total_employees"] > 0 else 0,
             "总缺勤次数": stats["total_absence_count"],
@@ -136,7 +145,7 @@ class DataExporter:
         self._ensure_dir(output_path)
 
         rows = []
-        for issue in self.data.check_issues:
+        for issue in self.data.get_month_issues():
             row = {
                 "工号": issue.employee_id,
                 "姓名": issue.employee_name,
@@ -145,6 +154,7 @@ class DataExporter:
                 "问题日期": issue.issue_date.strftime("%Y-%m-%d"),
                 "严重程度": issue.severity,
                 "是否需确认": "是" if issue.needs_confirmation else "否",
+                "处理截止日期": issue.deadline.strftime("%Y-%m-%d") if issue.deadline else "",
                 "问题描述": issue.description
             }
             rows.append(row)
@@ -205,6 +215,8 @@ class DataExporter:
         if output_path.endswith(".csv"):
             output_path = output_path.replace(".csv", ".xlsx")
 
+        standard_workdays = self.data.get_standard_workdays()
+
         with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
             payroll_rows = []
             for emp_summary in self.summary.generate_all_employee_summaries():
@@ -212,10 +224,16 @@ class DataExporter:
                 if not emp:
                     continue
                 total_leave_days = sum(emp_summary.leave_days.values())
+                issue_summary_parts = []
+                for issue_type, count in emp_summary.issue_summary.items():
+                    issue_summary_parts.append(f"{issue_type}×{count}")
+                issue_summary_str = "；".join(issue_summary_parts) if issue_summary_parts else ""
                 payroll_rows.append({
                     "工号": emp_summary.employee_id,
                     "姓名": emp_summary.name,
                     "部门": emp_summary.department,
+                    "应出勤天数": standard_workdays,
+                    "实际出勤天数": emp_summary.attendance_days,
                     "出勤天数": emp_summary.attendance_days,
                     "缺勤次数": emp_summary.absence_count,
                     "请假天数": round(total_leave_days, 2),
@@ -224,6 +242,8 @@ class DataExporter:
                     "迟到": emp_summary.late_count,
                     "早退": emp_summary.early_leave_count,
                     "漏打卡": emp_summary.missing_punch_count,
+                    "异常明细": issue_summary_str,
+                    "需确认": "是" if emp_summary.needs_confirmation else "否",
                 })
             pd.DataFrame(payroll_rows).to_excel(writer, index=False, sheet_name="工资核算")
 
@@ -232,6 +252,7 @@ class DataExporter:
                 dept_rows.append({
                     "部门": dept_summary.department,
                     "员工数": dept_summary.employee_count,
+                    "标准工作日": standard_workdays,
                     "总出勤天数": dept_summary.total_attendance_days,
                     "总缺勤": dept_summary.total_absence_count,
                     "总加班(小时)": dept_summary.total_overtime_hours,
@@ -241,7 +262,7 @@ class DataExporter:
             pd.DataFrame(dept_rows).to_excel(writer, index=False, sheet_name="部门汇总")
 
             issue_rows = []
-            for issue in self.data.check_issues:
+            for issue in self.data.get_month_issues():
                 issue_rows.append({
                     "工号": issue.employee_id,
                     "姓名": issue.employee_name,
@@ -250,12 +271,13 @@ class DataExporter:
                     "日期": issue.issue_date.strftime("%Y-%m-%d"),
                     "严重程度": issue.severity,
                     "需确认": "是" if issue.needs_confirmation else "否",
+                    "截止日期": issue.deadline.strftime("%Y-%m-%d") if issue.deadline else "",
                     "描述": issue.description
                 })
             pd.DataFrame(issue_rows).to_excel(writer, index=False, sheet_name="异常记录")
 
             leave_rows = []
-            for leave in self.data.leave_records:
+            for leave in self.data.get_month_leaves():
                 emp = self.data.get_employee(leave.employee_id)
                 leave_rows.append({
                     "工号": leave.employee_id,

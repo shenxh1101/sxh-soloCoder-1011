@@ -4,7 +4,7 @@ from pathlib import Path
 import random
 from typing import List, Dict
 
-from .models import LeaveType, AttendanceStatus
+from .models import LeaveType, AttendanceStatus, HolidayType
 
 
 class SampleDataGenerator:
@@ -241,6 +241,38 @@ class SampleDataGenerator:
         df.to_excel(output_path, index=False)
         return output_path
 
+    def generate_holidays(self, output_path: str) -> str:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        data = []
+
+        holidays = [
+            (date(2026, 4, 26), HolidayType.SPECIAL_WORKDAY, "五一调休上班", "09:00:00", "18:00:00", "周日调为工作日"),
+            (date(2026, 5, 1), HolidayType.HOLIDAY, "五一劳动节", "", "", "法定节假日"),
+            (date(2026, 5, 2), HolidayType.HOLIDAY, "五一劳动节", "", "", "法定节假日"),
+            (date(2026, 5, 3), HolidayType.HOLIDAY, "五一劳动节", "", "", "法定节假日"),
+            (date(2026, 5, 4), HolidayType.HOLIDAY, "五一劳动节", "", "", "法定节假日"),
+            (date(2026, 5, 5), HolidayType.HOLIDAY, "五一劳动节", "", "", "法定节假日"),
+            (date(2026, 5, 9), HolidayType.SPECIAL_WORKDAY, "五一调休上班", "09:00:00", "18:00:00", "周六调为工作日"),
+            (date(2026, 5, 12), HolidayType.COMPANY_HOLIDAY, "公司成立纪念日", "", "", "公司福利假期"),
+            (date(2026, 5, 31), HolidayType.SPECIAL_WORKDAY, "端午调休上班", "09:00:00", "18:00:00", "周日调为工作日"),
+            (date(2026, 6, 1), HolidayType.HOLIDAY, "端午节", "", "", "法定节假日"),
+            (date(2026, 6, 2), HolidayType.HOLIDAY, "端午节", "", "", "法定节假日"),
+        ]
+
+        for d, holiday_type, name, start, end, notes in holidays:
+            data.append({
+                "日期": d.strftime("%Y-%m-%d"),
+                "类型": holiday_type.value,
+                "名称": name,
+                "上班时间": start,
+                "下班时间": end,
+                "备注": notes
+            })
+
+        df = pd.DataFrame(data)
+        df.to_excel(output_path, index=False)
+        return output_path
+
     def generate_all(self, output_dir: str = "./data") -> Dict[str, str]:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         paths = {}
@@ -251,6 +283,7 @@ class SampleDataGenerator:
         paths["overtime"] = self.generate_overtime(f"{output_dir}/overtime.xlsx")
         paths["adjustments"] = self.generate_time_adjustments(f"{output_dir}/time_adjustments.xlsx")
         paths["balances"] = self.generate_leave_balances(f"{output_dir}/leave_balances.xlsx")
+        paths["holidays"] = self.generate_holidays(f"{output_dir}/holidays.xlsx")
         return paths
 
 
@@ -258,7 +291,7 @@ def generate_sample_data_command(output_dir: str = "./data"):
     """生成示例数据"""
     generator = SampleDataGenerator(year=2026, month=5)
     paths = generator.generate_all(output_dir)
-    print(f"✓ 示例数据已生成至 {output_dir} 目录:")
+    print("[OK] 示例数据已生成至 {} 目录:".format(output_dir))
     for name, path in paths.items():
-        print(f"  - {name}: {path}")
+        print("  - {}: {}".format(name, path))
     return paths

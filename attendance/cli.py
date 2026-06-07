@@ -4,8 +4,9 @@ from datetime import datetime
 from tabulate import tabulate
 from typing import Optional
 import os
+import re
 
-from .models import AttendanceData, LeaveType
+from .models import AttendanceData, LeaveType, ImportResult
 from .importer import DataImporter
 from .checker import AttendanceChecker
 from .summary import AttendanceSummary
@@ -19,18 +20,30 @@ class Context:
     def __init__(self, data_dir: str = "./data", output_dir: str = "./output"):
         self.data_dir = data_dir
         self.output_dir = output_dir
-        self.store = DataStore("./.attendance_store.pkl")
+        self.store = DataStore("./.attendance_data")
         self.data: AttendanceData = self._load_or_create_data()
         self._init_managers()
 
     def _load_or_create_data(self) -> AttendanceData:
-        if self.store.exists():
-            loaded = self.store.load()
-            if loaded:
-                return loaded
-        return AttendanceData()
+        current_month = self.store.get_current_month()
+        if current_month:
+            data = self.store.load(current_month)
+            if data:
+                return data
+
+        now = datetime.now()
+        default_month = f"{now.year}-{now.month:02d}"
+        return self.store.load_or_create(default_month)
 
     def _init_managers(self):
+        self.importer = DataImporter(self.data)
+        self.checker = AttendanceChecker(self.data)
+        self.summary = AttendanceSummary(self.data)
+        self.leave_manager = LeaveManager(self.data)
+        self.exporter = DataExporter(self.data)
+        self.notifier = Notifier(self.data)
+
+    def _reinit_managers(self):
         self.importer = DataImporter(self.data)
         self.checker = AttendanceChecker(self.data)
         self.summary = AttendanceSummary(self.data)
@@ -41,42 +54,168 @@ class Context:
     def save(self):
         self.store.save(self.data)
 
-    def clear(self):
-        self.store.clear()
+    def switch_month(self, month_str: str):
+        if not re.match(r'^\d{4}-\d{2}$', month_str):
+            raise ValueError(f"月份格式错误，请使用 YYYY-MM 格式，如 2026-05")
+
+        self.data = self.store.switch_month(month_str)
+        self._reinit_managers()
+
+    def clear_current_month(self):
+        current_month = self.data.month_str
+        if current_month:
+            self.store.clear_month(current_month)
         self.data = AttendanceData()
-        self._init_managers()
+        if current_month:
+            year, month = map(int, current_month.split('-'))
+            self.data.set_month(year, month)
+        self._reinit_managers()
+
+    def clear_all(self):
+        self.store.clear_all()
+        now = datetime.now()
+        default_month = f"{now.year}-{now.month:02d}"
+        self.data = self.store.load_or_create(default_month)
+        self._reinit_managers()
 
     def has_data(self) -> bool:
         return len(self.data.employees) > 0
 
-    def run_auto_check(self):
-        if not self.data.check_issues and self.data.punch_records:
-            self.checker.run_all_checks()
+    def run_auto_check(self, force: bool = False) -> bool:
+        needs_check = force or self.data.check_dirty
+        if needs_check and self.data.punch_records:
+            click.echo("[INFO] 数据已更新，正在重新执行检查...")
+            results = self.checker.run_all_checks()
             self.save()
+            click.echo(f"   检查完成，共发现 {results['total']} 条异常记录")
+            return True
+        return False
+
+    def get_current_month_display(self) -> str:
+        if self.data.month_str:
+            return self.data.month_str
+        return "未设置"
 
 
 pass_ctx = click.make_pass_decorator(Context)
 
 
+def _show_current_month(ctx: Context):
+    click.echo(f"[INFO] 当前工作区: {ctx.get_current_month_display()}")
+
+
+def _show_import_result(result: ImportResult):
+    click.echo(f"\n[OK] {result.file_type} 导入完成")
+    click.echo(f"  总计: {result.total} 条")
+
+    result_rows = []
+    if result.added > 0:
+        result_rows.append(["新增", click.style(str(result.added), fg="green")])
+    if result.updated > 0:
+        result_rows.append(["更新", click.style(str(result.updated), fg="yellow")])
+    if result.skipped > 0:
+        result_rows.append(["跳过", click.style(str(result.skipped), fg="cyan")])
+    if result.failed > 0:
+        result_rows.append(["失败", click.style(str(result.failed), fg="red")])
+
+    if result_rows:
+        click.echo(tabulate(result_rows, tablefmt="plain"))
+
+    if result.missing_columns:
+        click.echo(f"\n[ERROR] 缺少必要列: {', '.join(result.missing_columns)}")
+        click.echo("  请检查文件表头，确保包含上述必要信息")
+
+    if result.failed_reasons and result.failed > 0:
+        click.echo(f"\n[WARN]  失败详情（前5条）:")
+        for reason in result.failed_reasons[:5]:
+            click.echo(f"  - {reason}")
+        if len(result.failed_reasons) > 5:
+            click.echo(f"  ... 还有 {len(result.failed_reasons) - 5} 条错误")
+
+
 @click.group()
-@click.version_option(version="1.0.0", prog_name="attendance")
+@click.version_option(version="2.0.0", prog_name="attendance")
 @click.option("--data-dir", default="./data", help="数据文件目录")
 @click.option("--output-dir", default="./output", help="输出文件目录")
 @click.pass_context
 def cli(ctx, data_dir: str, output_dir: str):
-    """人力资源考勤数据管理命令行工具"""
+    """人力资源考勤数据管理命令行工具 - 支持按月份独立管理"""
     ctx_obj = Context(data_dir, output_dir)
     ctx.obj = ctx_obj
+
+
+@cli.command("use")
+@click.argument("month_str")
+@pass_ctx
+def use_command(ctx: Context, month_str: str):
+    """切换到指定月份工作区，格式: YYYY-MM（如 2026-05）"""
+    try:
+        old_month = ctx.get_current_month_display()
+        ctx.switch_month(month_str)
+        ctx.save()
+        click.echo(f"\n[OK] 已从 {old_month} 切换到 {month_str}")
+        _show_data_overview(ctx, quiet=True)
+
+        if ctx.data.check_dirty and ctx.data.punch_records:
+            click.echo(f"\n[WARN]  该月份数据需要重新检查，请运行 check 命令")
+
+    except ValueError as e:
+        click.echo(f"[ERROR] {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command("list")
+@click.option("--details", "-d", is_flag=True, help="显示详细信息")
+@pass_ctx
+def list_command(ctx: Context, details: bool):
+    """列出所有可用的月份工作区"""
+    months_info = ctx.store.get_all_months_info()
+
+    if not months_info:
+        click.echo("[INFO] 暂无可用的月份数据")
+        return
+
+    click.echo(f"\n[INFO] 共找到 {len(months_info)} 个月份工作区")
+    click.echo("=" * 60)
+
+    if details:
+        headers = ["月份", "当前", "员工", "打卡", "请假", "出差", "加班", "异常", "最后更新"]
+        rows = []
+        for info in months_info:
+            current_mark = "*" if info.get("is_current") else ""
+            rows.append([
+                info.get("month", ""),
+                current_mark,
+                info.get("employees", 0),
+                info.get("punch_records", 0),
+                info.get("leave_records", 0),
+                info.get("business_trips", 0),
+                info.get("overtime_records", 0),
+                info.get("check_issues", 0),
+                info.get("last_updated", "")[:16] if info.get("last_updated") else ""
+            ])
+        click.echo(tabulate(rows, headers, tablefmt="simple"))
+        click.echo("\n* 表示当前工作区")
+    else:
+        for info in months_info:
+            prefix = "* " if info.get("is_current") else "  "
+            month = info.get("month", "")
+            emp_count = info.get("employees", 0)
+            issue_count = info.get("check_issues", 0)
+            dirty = " (需要重新检查)" if info.get("check_dirty") and issue_count > 0 else ""
+            click.echo(f"{prefix}{month}  - {emp_count} 名员工, {issue_count} 条异常{dirty}")
 
 
 @cli.command("import")
 @click.option("--file", "-f", required=True, help="文件路径")
 @click.option("--type", "-t", "file_type", required=True,
-              type=click.Choice(["employee", "punch", "leave", "trip", "overtime", "adjust", "balance"]),
-              help="文件类型: employee(员工), punch(打卡), leave(请假), trip(出差), overtime(加班), adjust(调休), balance(余额)")
+              type=click.Choice(["employee", "punch", "leave", "trip", "overtime", "adjust", "balance", "holiday"]),
+              help="文件类型: employee(员工), punch(打卡), leave(请假), trip(出差), overtime(加班), adjust(调休), balance(余额), holiday(节假日)")
 @pass_ctx
 def import_command(ctx: Context, file: str, file_type: str):
-    """导入考勤相关文件（支持员工、打卡、请假、出差、加班、调休、假期余额）"""
+    """导入考勤相关文件（支持员工、打卡、请假、出差、加班、调休、假期余额、节假日）"""
+    _show_current_month(ctx)
+
     type_names = {
         "employee": "员工信息",
         "punch": "打卡记录",
@@ -84,17 +223,27 @@ def import_command(ctx: Context, file: str, file_type: str):
         "trip": "出差记录",
         "overtime": "加班记录",
         "adjust": "调休记录",
-        "balance": "假期余额"
+        "balance": "假期余额",
+        "holiday": "节假日设置",
     }
 
     try:
-        count = ctx.importer.import_file(file, file_type)
-        click.echo(f"\n[OK] 成功导入 {type_names[file_type]} 数据，共 {count} 条记录")
+        result = ctx.importer.import_file(file, file_type)
+
+        if result.missing_columns:
+            _show_import_result(result)
+            sys.exit(1)
+
+        _show_import_result(result)
+
+        if result.added > 0 or result.updated > 0:
+            ctx.data.clear_check_results()
+            ctx.save()
+            click.echo(f"\n[INFO] 已清除旧检查结果，下次运行 check/summary/export/notify 时将自动重新计算")
 
         if file_type == "punch" and ctx.data.year and ctx.data.month:
             click.echo(f"  统计月份: {ctx.data.year}年{ctx.data.month}月")
 
-        ctx.save()
         _show_data_overview(ctx)
 
     except FileNotFoundError as e:
@@ -109,29 +258,70 @@ def import_command(ctx: Context, file: str, file_type: str):
 
 
 @cli.command("clear")
+@click.option("--month", "-m", help="清空指定月份（格式: YYYY-MM），不指定则清空当前月份")
+@click.option("--all", "-a", is_flag=True, help="清空所有月份数据")
 @click.option("--yes", "-y", is_flag=True, help="跳过确认直接清空")
 @pass_ctx
-def clear_command(ctx: Context, yes: bool):
-    """清空当前所有数据，用于月度重新整理"""
+def clear_command(ctx: Context, month: Optional[str], all: bool, yes: bool):
+    """清空数据，支持按月份清空或全部清空"""
+    if all:
+        target = "所有月份"
+    elif month:
+        target = month
+    else:
+        target = f"当前月份 ({ctx.get_current_month_display()})"
+
     if not yes:
         click.echo("\n" + "=" * 60)
-        click.echo("[WARN]  即将清空所有考勤数据")
+        click.echo(click.style(f"[WARN]  即将清空 {target} 的所有考勤数据", fg="yellow", bold=True))
         click.echo("=" * 60)
-        if ctx.has_data():
-            click.echo("\n当前数据:")
-            _show_data_overview(ctx, quiet=True)
+
+        if all:
+            months = ctx.store.list_available_months()
+            if months:
+                click.echo(f"\n将清空以下月份:")
+                for m in months:
+                    click.echo(f"  - {m}")
+            else:
+                click.echo("\n当前没有任何月份数据")
         else:
-            click.echo("\n当前没有数据")
+            if ctx.has_data():
+                _show_data_overview(ctx, quiet=True)
+            else:
+                click.echo("\n当前没有数据")
 
         click.echo()
-        confirm = click.prompt("确认要清空所有数据吗？请输入 'yes' 继续", default="")
+        confirm = click.prompt("确认要清空吗？请输入 'yes' 继续", default="")
         if confirm.lower() != "yes":
             click.echo("已取消清空操作")
             return
 
-    ctx.clear()
-    click.echo("\n[OK] 所有数据已清空")
-    click.echo("  可以开始导入新月份的考勤数据了")
+    try:
+        if all:
+            count = ctx.store.clear_all()
+            ctx.clear_all()
+            click.echo(f"\n[OK] 已清空所有月份数据，共 {count} 个月份")
+        elif month:
+            if not re.match(r'^\d{4}-\d{2}$', month):
+                raise ValueError(f"月份格式错误，请使用 YYYY-MM 格式，如 2026-05")
+            success = ctx.store.delete_month(month)
+            if success:
+                if ctx.data.month_str == month:
+                    ctx.data = ctx._load_or_create_data()
+                    ctx._reinit_managers()
+                click.echo(f"\n[OK] 已清空 {month} 的数据")
+            else:
+                click.echo(f"[WARN]  {month} 不存在或已被清空")
+        else:
+            ctx.clear_current_month()
+            ctx.save()
+            click.echo(f"\n[OK] 已清空 {target} 的所有数据")
+
+        click.echo("  可以开始导入新的考勤数据了")
+
+    except ValueError as e:
+        click.echo(f"[ERROR] {e}", err=True)
+        sys.exit(1)
 
 
 @cli.command("check")
@@ -141,6 +331,8 @@ def clear_command(ctx: Context, yes: bool):
 @pass_ctx
 def check_command(ctx: Context, check_type):
     """检查考勤异常（迟到、早退、漏打卡、假期冲突、跨月班次、异常加班）"""
+    _show_current_month(ctx)
+
     if not ctx.has_data():
         click.echo("[WARN]  当前没有数据，请先使用 import 命令导入员工信息和打卡记录")
         return
@@ -162,6 +354,9 @@ def check_command(ctx: Context, check_type):
     click.echo("考勤异常检查")
     click.echo("=" * 60)
 
+    if ctx.data.check_dirty:
+        click.echo("[INFO] 检测到数据已更新，将执行全新检查")
+
     if check_type:
         ctx.data.check_issues.clear()
         results = {}
@@ -172,6 +367,7 @@ def check_command(ctx: Context, check_type):
             results[ct] = count
             click.echo(f"  发现 {count} 条异常")
         results["total"] = sum(results.values())
+        ctx.data.mark_check_done()
     else:
         click.echo("\n正在执行全部检查...")
         results = ctx.checker.run_all_checks()
@@ -212,7 +408,7 @@ def check_command(ctx: Context, check_type):
         detail_headers = ["序号", "员工", "部门", "类型", "日期", "严重程度", "需确认", "描述"]
         detail_rows = []
 
-        for i, issue in enumerate(ctx.data.check_issues[:50], 1):
+        for i, issue in enumerate(ctx.data.get_month_issues()[:50], 1):
             severity_style = {"error": "red", "warning": "yellow", "info": "blue"}
             severity = click.style(
                 {"error": "错误", "warning": "警告", "info": "提示"}[issue.severity],
@@ -228,10 +424,10 @@ def check_command(ctx: Context, check_type):
 
         click.echo(tabulate(detail_rows, detail_headers, tablefmt="simple"))
 
-        if len(ctx.data.check_issues) > 50:
-            click.echo(f"\n... 还有 {len(ctx.data.check_issues) - 50} 条异常未显示，使用 export 命令导出完整报告")
+        if len(ctx.data.get_month_issues()) > 50:
+            click.echo(f"\n... 还有 {len(ctx.data.get_month_issues()) - 50} 条异常未显示，使用 export 命令导出完整报告")
 
-    needs_confirm = [i for i in ctx.data.check_issues if i.needs_confirmation]
+    needs_confirm = [i for i in ctx.data.get_month_issues() if i.needs_confirmation]
     if needs_confirm:
         click.echo(f"\n[WARN]  共有 {len(needs_confirm)} 条记录需要员工确认，可使用 notify 命令查看详情")
 
@@ -242,6 +438,8 @@ def check_command(ctx: Context, check_type):
 @pass_ctx
 def summary_command(ctx: Context, department: Optional[str], employee: Optional[str]):
     """按部门输出出勤统计（出勤天数、缺勤次数、加班时长、需确认人员）"""
+    _show_current_month(ctx)
+
     if not ctx.has_data():
         click.echo("[WARN]  当前没有数据，请先使用 import 命令导入员工信息和打卡记录")
         return
@@ -250,10 +448,7 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
         click.echo("[WARN]  未找到打卡或请假记录，统计结果可能不完整")
         click.echo("  请使用 import -t punch 导入打卡记录")
 
-    if not ctx.data.check_issues and ctx.data.punch_records:
-        click.echo("[INFO]  正在自动执行考勤检查...")
-        ctx.checker.run_all_checks()
-        ctx.save()
+    rechecked = ctx.run_auto_check()
 
     click.echo("\n" + "=" * 60)
 
@@ -274,8 +469,11 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
                 ["姓名", emp_summary.name],
                 ["部门", emp_summary.department],
                 ["职位", emp.position if emp else ""],
-                ["统计月份", f"{ctx.data.year}年{ctx.data.month}月" if ctx.data.year else "全部"],
+                ["统计月份", ctx.data.month_str or f"{ctx.data.year}年{ctx.data.month}月"],
+                ["标准工作日", emp_summary.standard_workdays],
             ]
+            if rechecked:
+                info_rows.append(["数据状态", click.style("已重新计算", fg="green")])
             click.echo(tabulate(info_rows, tablefmt="plain"))
 
             click.echo("\n" + "-" * 60)
@@ -283,6 +481,8 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
             click.echo("-" * 60)
 
             stat_rows = [
+                ["应出勤天数", emp_summary.standard_workdays],
+                ["实际出勤天数", emp_summary.attendance_days],
                 ["出勤天数", emp_summary.attendance_days],
                 ["缺勤次数", click.style(str(emp_summary.absence_count), fg="red" if emp_summary.absence_count > 0 else "green")],
                 ["出差天数", emp_summary.business_trip_days],
@@ -295,6 +495,12 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
             if emp_summary.leave_days:
                 for leave_type, days in emp_summary.leave_days.items():
                     stat_rows.append([f"{leave_type}天数", days])
+
+            if emp_summary.issue_summary:
+                issue_parts = [f"{k}×{v}" for k, v in emp_summary.issue_summary.items()]
+                stat_rows.append(["异常汇总", "、".join(issue_parts)])
+
+            stat_rows.append(["需确认", click.style("是", fg="red") if emp_summary.needs_confirmation else "否"])
 
             click.echo(tabulate(stat_rows, tablefmt="simple"))
 
@@ -311,20 +517,21 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
                         fg=severity_style.get(issue.severity, "white")
                     )
                     needs_confirm = click.style("需确认", fg="red") if issue.needs_confirmation else ""
+                    deadline = issue.deadline.strftime("%Y-%m-%d") if issue.deadline else ""
                     issue_rows.append([
                         i, issue.issue_type.value, issue.issue_date.strftime("%Y-%m-%d"),
-                        severity, needs_confirm, issue.description
+                        severity, needs_confirm, deadline, issue.description
                     ])
 
-                click.echo(tabulate(issue_rows, ["序号", "类型", "日期", "严重程度", "需确认", "描述"], tablefmt="simple"))
+                click.echo(tabulate(issue_rows, ["序号", "类型", "日期", "严重程度", "需确认", "截止日期", "描述"], tablefmt="simple"))
 
         except ValueError as e:
             click.echo(f"[ERROR] 错误: {e}", err=True)
             sys.exit(1)
 
     else:
-        if ctx.data.year and ctx.data.month:
-            click.echo(f"部门考勤汇总 - {ctx.data.year}年{ctx.data.month}月")
+        if ctx.data.month_str:
+            click.echo(f"部门考勤汇总 - {ctx.data.month_str}")
         else:
             click.echo("部门考勤汇总")
         click.echo("=" * 60)
@@ -338,7 +545,7 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
         else:
             dept_summaries = ctx.summary.generate_all_department_summaries()
 
-        headers = ["部门", "人数", "总出勤天数", "人均出勤", "缺勤次数", "总加班(小时)", "人均加班", "出勤率(%)", "需确认人数", "需确认人员"]
+        headers = ["部门", "人数", "标准工作日", "总出勤天数", "人均出勤", "缺勤次数", "总加班(小时)", "人均加班", "出勤率(%)", "需确认人数", "需确认人员"]
         rows = []
 
         for ds in dept_summaries:
@@ -346,6 +553,7 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
             rows.append([
                 ds.department,
                 ds.employee_count,
+                ds.standard_workdays,
                 ds.total_attendance_days,
                 round(ds.total_attendance_days / ds.employee_count, 2) if ds.employee_count > 0 else 0,
                 click.style(str(ds.total_absence_count), fg="red" if ds.total_absence_count > 0 else "green"),
@@ -363,6 +571,8 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
         click.echo("整体统计")
         click.echo("-" * 60)
         overall_rows = [
+            ["统计月份", stats.get("month_str", f"{stats['year']}年{stats['month']}月")],
+            ["标准工作日", stats["standard_workdays"]],
             ["员工总数", stats["total_employees"]],
             ["部门总数", stats["total_departments"]],
             ["总出勤天数", stats["total_attendance_days"]],
@@ -373,6 +583,8 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
             ["需确认员工数", click.style(str(stats["employees_needing_confirmation"]), fg="red" if stats["employees_needing_confirmation"] > 0 else "green")],
             ["总异常数", click.style(str(stats["total_check_issues"]), fg="yellow" if stats["total_check_issues"] > 0 else "green")],
         ]
+        if rechecked:
+            overall_rows.append(["数据状态", click.style("已重新计算", fg="green")])
         click.echo(tabulate(overall_rows, tablefmt="simple"))
 
 
@@ -385,6 +597,8 @@ def summary_command(ctx: Context, department: Optional[str], employee: Optional[
 @pass_ctx
 def leave_command(ctx: Context, employee: Optional[str], leave_type: Optional[str], low_balance: bool):
     """查询员工假期余额"""
+    _show_current_month(ctx)
+
     if not ctx.has_data():
         click.echo("[WARN]  当前没有数据，请先使用 import 命令导入员工信息和假期余额")
         return
@@ -476,12 +690,14 @@ def leave_command(ctx: Context, employee: Optional[str], leave_type: Optional[st
         records = ctx.leave_manager.get_leave_records(employee, lt)
         if records:
             click.echo("\n" + "-" * 60)
-            click.echo("请假记录")
+            click.echo("本月请假记录")
             click.echo("-" * 60)
 
             rec_headers = ["序号", "假别", "开始日期", "结束日期", "天数", "原因", "状态"]
             rec_rows = []
             for i, rec in enumerate(records[:20], 1):
+                if not ctx.data.is_in_month(rec.start_date) and not ctx.data.is_in_month(rec.end_date):
+                    continue
                 status = click.style("已批准", fg="green") if rec.approved else click.style("待审批", fg="yellow")
                 rec_rows.append([
                     i, rec.leave_type.value,
@@ -561,16 +777,15 @@ def leave_command(ctx: Context, employee: Optional[str], leave_type: Optional[st
 @pass_ctx
 def export_command(ctx: Context, export_type: str, output: Optional[str], fmt: str):
     """生成工资核算用清单（自动执行必要的检查）"""
+    _show_current_month(ctx)
+
     if not ctx.has_data():
         click.echo("[WARN]  当前没有数据，请先使用 import 命令导入数据")
         return
 
+    rechecked = False
     if export_type in ["payroll", "department", "issues", "full"]:
-        if not ctx.data.check_issues and ctx.data.punch_records:
-            click.echo("[INFO]  正在自动执行考勤检查，确保导出数据完整...")
-            ctx.checker.run_all_checks()
-            ctx.save()
-            click.echo(f"   检查完成，发现 {len(ctx.data.check_issues)} 条异常记录")
+        rechecked = ctx.run_auto_check()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     type_names = {
@@ -583,11 +798,14 @@ def export_command(ctx: Context, export_type: str, output: Optional[str], fmt: s
 
     if not output:
         os.makedirs(ctx.output_dir, exist_ok=True)
-        filename = f"{type_names[export_type]}_{timestamp}.{fmt}"
+        month_str = ctx.data.month_str or datetime.now().strftime("%Y-%m")
+        filename = f"{month_str}_{type_names[export_type]}_{timestamp}.{fmt}"
         output = f"{ctx.output_dir}/{filename}"
 
     try:
         click.echo(f"\n正在生成 {type_names[export_type]}...")
+        if rechecked:
+            click.echo("[INFO] 基于最新数据重新计算完成")
 
         if export_type == "payroll":
             path = ctx.exporter.export_payroll_data(output)
@@ -606,8 +824,8 @@ def export_command(ctx: Context, export_type: str, output: Optional[str], fmt: s
         click.echo(f"\n[OK] 导出成功！文件已保存至: {path}")
 
         emp_count = len(ctx.data.employees)
-        issue_count = len(ctx.data.check_issues)
-        needs_confirm = len([i for i in ctx.data.check_issues if i.needs_confirmation])
+        issue_count = len(ctx.data.get_month_issues())
+        needs_confirm = len([i for i in ctx.data.get_month_issues() if i.needs_confirmation])
 
         if export_type == "payroll":
             click.echo(f"  包含 {emp_count} 名员工的工资核算数据")
@@ -630,21 +848,19 @@ def export_command(ctx: Context, export_type: str, output: Optional[str], fmt: s
 @pass_ctx
 def notify_command(ctx: Context, employee: Optional[str], department: Optional[str], export_path: Optional[str]):
     """列出需要员工补充说明的记录（自动执行必要的检查）"""
+    _show_current_month(ctx)
+
     if not ctx.has_data():
         click.echo("[WARN]  当前没有数据，请先使用 import 命令导入数据")
         return
 
-    if not ctx.data.check_issues and ctx.data.punch_records:
-        click.echo("[INFO]  正在自动执行考勤检查...")
-        ctx.checker.run_all_checks()
-        ctx.save()
-        click.echo(f"   检查完成，发现 {len(ctx.data.check_issues)} 条异常记录")
+    rechecked = ctx.run_auto_check()
 
-    if not ctx.data.check_issues:
+    if not ctx.data.get_month_issues():
         click.echo("[OK] 没有发现异常记录，所有考勤数据正常")
         return
 
-    needs_confirm = [i for i in ctx.data.check_issues if i.needs_confirmation]
+    needs_confirm = [i for i in ctx.data.get_month_issues() if i.needs_confirmation]
     if not needs_confirm:
         click.echo("[OK] 没有需要员工确认的记录，所有异常已处理")
         return
@@ -653,8 +869,12 @@ def notify_command(ctx: Context, employee: Optional[str], department: Optional[s
     click.echo("待员工确认记录")
     click.echo("=" * 60)
 
+    if rechecked:
+        click.echo("[INFO] 基于最新数据重新计算完成")
+
     summary_stats = ctx.notifier.get_overall_notification_summary()
-    click.echo(f"\n统计月份: {summary_stats['year']}年{summary_stats['month']}月")
+    month_display = summary_stats.get('month_str') or "{}年{}月".format(summary_stats["year"], summary_stats["month"])
+    click.echo("\n统计月份: {}".format(month_display))
     click.echo(f"涉及部门: {summary_stats['affected_departments']} 个")
     click.echo(f"涉及员工: {summary_stats['affected_employees']} 人")
     click.echo(f"待确认总数: {click.style(str(summary_stats['total_notifications']), fg='red')} 条")
@@ -692,11 +912,12 @@ def notify_command(ctx: Context, employee: Optional[str], department: Optional[s
                     {"error": "错误", "warning": "警告", "info": "提示"}[issue.severity],
                     fg=severity_style.get(issue.severity, "white")
                 )
+                deadline = issue.deadline.strftime("%Y-%m-%d") if issue.deadline else ""
                 issue_rows.append([
                     i, issue.issue_type.value, issue.issue_date.strftime("%Y-%m-%d"),
-                    severity, issue.description
+                    severity, deadline, issue.description
                 ])
-            click.echo(tabulate(issue_rows, ["序号", "类型", "日期", "严重程度", "描述"], tablefmt="simple"))
+            click.echo(tabulate(issue_rows, ["序号", "类型", "日期", "严重程度", "截止日期", "描述"], tablefmt="simple"))
 
     elif department:
         dept_emps = [eid for eid, e in ctx.data.employees.items() if e.department == department]
@@ -721,14 +942,16 @@ def notify_command(ctx: Context, employee: Optional[str], department: Optional[s
         messages = ctx.notifier.generate_notification_messages()
 
         click.echo("\n通知列表:")
-        msg_headers = ["序号", "员工", "部门", "待确认数", "问题类型", "通知内容"]
+        msg_headers = ["序号", "员工", "部门", "待确认数", "问题类型", "最早截止日期", "通知内容"]
         msg_rows = []
 
         for i, msg in enumerate(messages, 1):
+            deadline_str = msg["earliest_deadline"].strftime("%Y-%m-%d") if msg["earliest_deadline"] else ""
             msg_rows.append([
                 i, msg["name"], msg["department"],
                 click.style(str(msg["notification_count"]), fg="red"),
                 "、".join(msg["issue_types"]),
+                deadline_str,
                 msg["message"]
             ])
 
@@ -736,6 +959,25 @@ def notify_command(ctx: Context, employee: Optional[str], department: Optional[s
 
         reminders = ctx.notifier.get_reminder_list()
         urgent = [r for r in reminders if r["is_urgent"]]
+        overdue = [r for r in reminders if r["is_overdue"]]
+
+        if overdue:
+            click.echo("\n" + "-" * 60)
+            click.echo(click.style("[WARN]  已逾期（超过截止日期）", fg="red", bold=True))
+            click.echo("-" * 60)
+
+            overdue_rows = []
+            for r in overdue[:10]:
+                overdue_rows.append([
+                    r["name"], r["department"], r["pending_count"],
+                    r["oldest_issue_date"], r["earliest_deadline"], r["days_pending"]
+                ])
+
+            click.echo(tabulate(
+                overdue_rows,
+                ["员工", "部门", "待确认数", "最早日期", "截止日期", "已等待(天)"],
+                tablefmt="simple"
+            ))
 
         if urgent:
             click.echo("\n" + "-" * 60)
@@ -759,6 +1001,7 @@ def notify_command(ctx: Context, employee: Optional[str], department: Optional[s
         saved_path = ctx.notifier.export_notification_list(export_path)
         click.echo(f"\n[OK] 待确认列表已导出至: {saved_path}")
         click.echo(f"  共 {len(needs_confirm)} 条待确认记录")
+        click.echo(f"  包含字段: 部门、工号、姓名、异常日期、异常类型、异常原因、严重程度、处理截止日期")
 
 
 def _show_data_overview(ctx: Context, quiet: bool = False):
@@ -766,14 +1009,17 @@ def _show_data_overview(ctx: Context, quiet: bool = False):
         click.echo("\n当前数据概览:")
     overview_rows = [
         ["员工信息", len(ctx.data.employees)],
-        ["打卡记录", len(ctx.data.punch_records)],
-        ["请假记录", len(ctx.data.leave_records)],
-        ["出差记录", len(ctx.data.business_trip_records)],
-        ["加班记录", len(ctx.data.overtime_records)],
+        ["打卡记录", len(ctx.data.get_month_punches())],
+        ["请假记录", len(ctx.data.get_month_leaves())],
+        ["出差记录", len(ctx.data.get_month_business_trips())],
+        ["加班记录", len(ctx.data.get_month_overtimes())],
         ["调休记录", len(ctx.data.time_adjustment_records)],
         ["假期余额", sum(len(v) for v in ctx.data.leave_balances.values())],
-        ["检查异常", len(ctx.data.check_issues)],
+        ["节假日设置", len(ctx.data.holidays)],
+        ["检查异常", len(ctx.data.get_month_issues())],
     ]
+    if ctx.data.check_dirty and ctx.data.has_any_records():
+        overview_rows.append(["数据状态", click.style("需要重新检查", fg="yellow")])
     click.echo(tabulate(overview_rows, tablefmt="simple"))
 
 
