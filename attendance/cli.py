@@ -326,11 +326,11 @@ def clear_command(ctx: Context, month: Optional[str], all: bool, yes: bool):
 
 @cli.command("check")
 @click.option("--check-type", "-c", multiple=True,
-              type=click.Choice(["late", "early", "missing", "conflict", "cross_month", "overtime"]),
+              type=click.Choice(["late", "early", "missing", "absent", "conflict", "cross_month", "overtime"]),
               help="指定检查类型，可多选。不指定则执行全部检查")
 @pass_ctx
 def check_command(ctx: Context, check_type):
-    """检查考勤异常（迟到、早退、漏打卡、假期冲突、跨月班次、异常加班）"""
+    """检查考勤异常（迟到、早退、漏打卡、缺勤、假期冲突、跨月班次、异常加班）"""
     _show_current_month(ctx)
 
     if not ctx.has_data():
@@ -345,6 +345,7 @@ def check_command(ctx: Context, check_type):
         "late": ("迟到检查", ctx.checker.check_late_arrival),
         "early": ("早退检查", ctx.checker.check_early_leave),
         "missing": ("漏打卡检查", ctx.checker.check_missing_punch),
+        "absent": ("缺勤检查", ctx.checker.check_absent_on_special_workdays),
         "conflict": ("假期冲突检查", ctx.checker.check_leave_conflicts),
         "cross_month": ("跨月班次检查", ctx.checker.check_cross_month_shifts),
         "overtime": ("异常加班检查", ctx.checker.check_abnormal_overtime),
@@ -385,6 +386,7 @@ def check_command(ctx: Context, check_type):
         "late_arrival": "迟到",
         "early_leave": "早退",
         "missing_punch": "漏打卡",
+        "absent": "缺勤",
         "leave_conflicts": "假期冲突",
         "cross_month_shifts": "跨月班次",
         "abnormal_overtime": "异常加班",

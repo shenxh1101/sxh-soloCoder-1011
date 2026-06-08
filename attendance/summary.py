@@ -56,13 +56,15 @@ class AttendanceSummary:
 
         for leave in leaves:
             if leave.approved:
-                if self.data.is_in_month(leave.start_date) or self.data.is_in_month(leave.end_date):
-                    leave_days[leave.leave_type.value] += leave.days
+                days_in_month = self.data.get_days_in_month(leave.start_date, leave.end_date)
+                if days_in_month > 0:
+                    leave_days[leave.leave_type.value] += days_in_month
 
         for trip in trips:
-            if self.data.is_in_month(trip.start_date) or self.data.is_in_month(trip.end_date):
-                business_trip_days += trip.days
-                attendance_days += trip.days
+            days_in_month = self.data.get_days_in_month(trip.start_date, trip.end_date)
+            if days_in_month > 0:
+                business_trip_days += days_in_month
+                attendance_days += days_in_month
 
         for ot in overtimes:
             if ot.approved:
@@ -70,6 +72,8 @@ class AttendanceSummary:
 
         for issue in issues:
             issue_summary[issue.issue_type.value] += 1
+            if issue.issue_type == CheckIssueType.ABSENT:
+                absence_count += 1
 
         needs_confirm = any(i.needs_confirmation for i in issues)
 

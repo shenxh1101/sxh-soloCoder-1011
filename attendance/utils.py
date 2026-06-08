@@ -84,6 +84,10 @@ class SampleDataGenerator:
                     continue
                 elif emp_id == "E009" and d.day == 22:
                     continue
+                elif emp_id in ["E008", "E009", "E010"] and d.day == 9:
+                    continue
+                elif emp_id in ["E005", "E007"] and d.day == 31:
+                    continue
                 elif rand_val < 0.05:
                     punch_in_time = time(9, 12)
                     status = AttendanceStatus.LATE
@@ -117,6 +121,7 @@ class SampleDataGenerator:
             ("E002", LeaveType.PERSONAL, date(2026, 5, 25), date(2026, 5, 26), 2, "家事处理"),
             ("E008", LeaveType.MATERNITY, date(2026, 6, 1), date(2026, 8, 31), 92, "产假"),
             ("E007", LeaveType.ANNUAL, date(2026, 5, 10), date(2026, 5, 11), 2, "重复申请"),
+            ("E001", LeaveType.ANNUAL, date(2026, 5, 30), date(2026, 6, 2), 4, "跨月年假（5月2天，6月2天）"),
         ]
 
         for emp_id, leave_type, start, end, days, reason in leaves:
@@ -140,8 +145,9 @@ class SampleDataGenerator:
 
         trips = [
             ("E001", date(2026, 5, 18), date(2026, 5, 20), 3, "北京", "客户现场调试"),
-            ("E006", date(2026, 5, 25), date(2026, 6, 2), 7, "上海", "市场推广活动"),
+            ("E006", date(2026, 5, 25), date(2026, 6, 2), 9, "上海", "市场推广活动（跨月，5月7天，6月2天）"),
             ("E004", date(2026, 5, 7), date(2026, 5, 8), 2, "深圳", "产品评审会议"),
+            ("E003", date(2026, 5, 30), date(2026, 6, 2), 4, "广州", "跨月出差（5月2天，6月2天）"),
         ]
 
         for emp_id, start, end, days, location, purpose in trips:

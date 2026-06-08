@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from datetime import datetime, date, time
+from datetime import datetime, date, time, timedelta
 from enum import Enum
 from typing import List, Optional, Dict, Tuple
 from collections import defaultdict
@@ -33,6 +33,7 @@ class CheckIssueType(str, Enum):
     LATE = "迟到"
     EARLY_LEAVE = "早退"
     MISSING_PUNCH = "漏打卡"
+    ABSENT = "缺勤"
     LEAVE_CONFLICT = "假期冲突"
     CROSS_MONTH_SHIFT = "跨月班次"
     ABNORMAL_OVERTIME = "异常加班"
@@ -292,6 +293,46 @@ class AttendanceData:
             holiday = self.holidays[d]
             return holiday.holiday_type in [HolidayType.HOLIDAY, HolidayType.WEEKEND_ADJUST, HolidayType.COMPANY_HOLIDAY]
         return False
+
+    def get_days_in_month(self, start_date: date, end_date: date) -> float:
+        if self.year == 0 or self.month == 0:
+            return (end_date - start_date).days + 1
+
+        from datetime import date as dt_date
+        month_start = dt_date(self.year, self.month, 1)
+        if self.month == 12:
+            month_end = dt_date(self.year + 1, 1, 1) - timedelta(days=1)
+        else:
+            month_end = dt_date(self.year, self.month + 1, 1) - timedelta(days=1)
+
+        overlap_start = max(start_date, month_start)
+        overlap_end = min(end_date, month_end)
+
+        if overlap_start > overlap_end:
+            return 0.0
+
+        return (overlap_end - overlap_start).days + 1
+
+    def is_special_workday(self, d: date) -> bool:
+        if d in self.holidays:
+            holiday = self.holidays[d]
+            return holiday.holiday_type == HolidayType.SPECIAL_WORKDAY
+        return False
+
+    def get_month_workdays(self) -> List[date]:
+        if self.year == 0 or self.month == 0:
+            return []
+
+        import calendar
+        cal = calendar.Calendar()
+        workdays = []
+        for day in cal.itermonthdays(self.year, self.month):
+            if day == 0:
+                continue
+            d = date(self.year, self.month, day)
+            if self.is_workday(d):
+                workdays.append(d)
+        return workdays
 
     def get_employee(self, employee_id: str) -> Optional[Employee]:
         return self.employees.get(employee_id)

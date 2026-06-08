@@ -129,22 +129,28 @@ class LeaveManager:
         total_approved_leaves = 0
         total_pending_leaves = 0
         total_leave_days = 0.0
+        total_records = 0
         leave_type_count: Dict[str, int] = defaultdict(int)
         leave_type_days: Dict[str, float] = defaultdict(float)
 
         for leave in self.data.leave_records:
+            days_in_month = self.data.get_days_in_month(leave.start_date, leave.end_date)
+            if days_in_month <= 0:
+                continue
+
+            total_records += 1
             if leave.approved:
                 total_approved_leaves += 1
-                total_leave_days += leave.days
+                total_leave_days += days_in_month
                 leave_type_count[leave.leave_type.value] += 1
-                leave_type_days[leave.leave_type.value] += leave.days
+                leave_type_days[leave.leave_type.value] += days_in_month
             else:
                 total_pending_leaves += 1
 
         return {
             "year": self.data.year,
             "month": self.data.month,
-            "total_leave_records": len(self.data.leave_records),
+            "total_leave_records": total_records,
             "approved_leaves": total_approved_leaves,
             "pending_leaves": total_pending_leaves,
             "total_leave_days": round(total_leave_days, 2),

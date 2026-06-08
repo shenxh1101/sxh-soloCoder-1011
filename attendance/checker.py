@@ -361,6 +361,59 @@ class AttendanceChecker:
 
         return count
 
+    def check_absent_on_special_workdays(self) -> int:
+        count = 0
+        if self.data.year == 0 or self.data.month == 0:
+            return count
+
+        month_workdays = self.data.get_month_workdays()
+        special_workdays = [d for d in month_workdays if self.data.is_special_workday(d)]
+
+        if not special_workdays:
+            return count
+
+        for emp_id in self.data.employees:
+            punches = self.data.get_employee_punches(emp_id, month_only=True)
+            leaves = self.data.get_employee_leaves(emp_id, month_only=True)
+            trips = self.data.get_employee_business_trips(emp_id, month_only=True)
+
+            punch_dates = {p.punch_date for p in punches}
+            leave_dates = set()
+            for leave in leaves:
+                days_in_month = self.data.get_days_in_month(leave.start_date, leave.end_date)
+                if days_in_month > 0:
+                    from datetime import timedelta
+                    current = max(leave.start_date, date(self.data.year, self.data.month, 1))
+                    end = min(leave.end_date, date(self.data.year, self.data.month + 1, 1) - timedelta(days=1)) if self.data.month < 12 else min(leave.end_date, date(self.data.year + 1, 1, 1) - timedelta(days=1))
+                    while current <= end:
+                        leave_dates.add(current)
+                        current += timedelta(days=1)
+
+            trip_dates = set()
+            for trip in trips:
+                days_in_month = self.data.get_days_in_month(trip.start_date, trip.end_date)
+                if days_in_month > 0:
+                    from datetime import timedelta
+                    current = max(trip.start_date, date(self.data.year, self.data.month, 1))
+                    end = min(trip.end_date, date(self.data.year, self.data.month + 1, 1) - timedelta(days=1)) if self.data.month < 12 else min(trip.end_date, date(self.data.year + 1, 1, 1) - timedelta(days=1))
+                    while current <= end:
+                        trip_dates.add(current)
+                        current += timedelta(days=1)
+
+            for d in special_workdays:
+                if d not in punch_dates and d not in leave_dates and d not in trip_dates:
+                    self._add_issue(
+                        employee_id=emp_id,
+                        issue_type=CheckIssueType.ABSENT,
+                        issue_date=d,
+                        description=f"特殊工作日缺勤：{d.strftime('%Y-%m-%d')} 为调休工作日，无打卡、请假或出差记录",
+                        severity="error",
+                        needs_confirmation=True
+                    )
+                    count += 1
+
+        return count
+
     def run_all_checks(self) -> Dict[str, int]:
         self.data.check_issues.clear()
 
@@ -368,6 +421,7 @@ class AttendanceChecker:
             "late_arrival": self.check_late_arrival(),
             "early_leave": self.check_early_leave(),
             "missing_punch": self.check_missing_punch(),
+            "absent": self.check_absent_on_special_workdays(),
             "leave_conflicts": self.check_leave_conflicts(),
             "cross_month_shifts": self.check_cross_month_shifts(),
             "abnormal_overtime": self.check_abnormal_overtime(),

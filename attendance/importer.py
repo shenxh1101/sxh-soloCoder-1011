@@ -81,7 +81,7 @@ class DataImporter:
             return True
         if isinstance(value, bool):
             return value
-        return str(value).lower() in ["true", "是", "yes", "1", "批准", "通过"]
+        return str(value).lower() in ["true", "是", "yes", "1", "批准", "已批准", "通过", "已通过"]
 
     def _match_column(self, df_columns, keywords):
         for col in df_columns:
